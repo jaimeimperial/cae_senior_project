@@ -6,16 +6,42 @@ from collections import deque
 QR_SIZE_CM = 3               # Size of QR code (cm)
 FOCAL_LENGTH = 1238.40
 
+colors = {
+    'test_purple' :    [[110, 50, 130],    [130, 80, 190]],
+    'test_yellow' :    [[20, 110, 240],    [30, 150, 255]],
+    'black':    [[180, 255, 30],    [0, 0, 0]],
+    'white':    [[180, 18, 255],    [0, 0, 231]],
+    'red1':     [[180, 255, 255],   [159, 50, 70]],
+    'red2':     [[9, 255, 255],     [0, 50, 70]],
+    'green':    [[89, 255, 255],    [36, 50, 70]],
+    'blue':     [[128, 255, 255],   [90, 50, 70]],
+    'yellow':   [[35, 255, 255],    [25, 50, 70]],
+    'purple':   [[158, 255, 255],   [129, 50, 70]],
+    'orange':   [[24, 255, 255],    [10, 50, 70]],
+    'gray':     [[180, 18, 230],    [0, 0, 40]]
+}
+
+# Define color range for light detection (e.g., red light)
+color = "test_yellow"
+lower_color = np.array(colors[color][0])
+upper_color = np.array(colors[color][1])
+
 # Initialize Mediapipe Hands
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7)
-previous_thumb_y = None
 
-colors = {
-    "green" : ([50, 0, 55], [86, 255, 255]),
-    "white" : ([0,0,240], [255, 15, 255])
-}
+global qr_scanned, saved_rvec, saved_tvec, saved_bbox, saved_data
+previous_thumb_y = None
+previous_thumb_x = None
+previous_y = None
+previous_x = None
+projected_image_box = None
+qr_scanned = False
+saved_rvec = None
+saved_tvec = None
+saved_bbox = None
+saved_data = None
 
 # Switch Regions
 z_offset = 0.5  # Dynamic Z-distance in front of QR
@@ -27,7 +53,7 @@ switch_centers = [
         [1.8, 9.5, z_offset],
         [6.0, 9.5, z_offset],
     ]
-switch_size = (2.0, 2.0)  # Width and height
+switch_size = (2.5, 3.0)  # Width and height
 
 led_boxes_local = []
 for cx, cy, cz in switch_centers:
@@ -52,6 +78,16 @@ object_points = np.array([
     [QR_SIZE_CM, QR_SIZE_CM, 0],
     [0, QR_SIZE_CM, 0]
 ], dtype=np.float32)
+
+def in_box(box, x, y):
+    right_edge = max(box[1][0], box[2][0])
+    top_edge = max(box[2][1], box[3][1])
+    left_edge = min(box[0][0], box[3][0])
+    bottom_edge = min(box[0][1], box[1][1])
+    if (bottom_edge <= y <= top_edge) and (left_edge <= x <= right_edge):
+        return True
+    else:
+        return False
 
 def detect_single_qr_code(frame):
     qr_decoder = cv2.QRCodeDetector()
@@ -111,9 +147,14 @@ def draw_qr_pose_info(frame, bbox, data, rvec, tvec, camera_matrix, dist_coeffs)
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
     # Draw each switch region
+    global projected_image_box 
+    projected_image_box = []
+
     for i, box in enumerate(led_boxes_local):
         image_box, _ = cv2.projectPoints(box, rvec, tvec, camera_matrix, dist_coeffs)
         image_box = image_box.reshape(-1, 2).astype(int)
+
+        projected_image_box.append(image_box)
 
         cv2.polylines(frame, [image_box], isClosed=True, color=(255, 255, 0), thickness=2)
         cx, cy = np.mean(image_box, axis=0).astype(int)
@@ -128,8 +169,8 @@ def draw_qr_pose_info(frame, bbox, data, rvec, tvec, camera_matrix, dist_coeffs)
     """
 
 cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+#cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+#cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -144,6 +185,26 @@ while cap.isOpened():
     dist_coeffs = np.zeros((4, 1)) 
 
     results = hands.process(frame_rgb)
+
+    if not qr_scanned:
+        data, bbox = detect_single_qr_code(frame)
+        if bbox is not None and len(bbox) == 4:
+            success, rvec, tvec = cv2.solvePnP(
+                object_points, bbox, camera_matrix, dist_coeffs,
+                flags=cv2.SOLVEPNP_ITERATIVE
+            )
+            if success:
+                qr_scanned = True
+                saved_rvec = rvec
+                saved_tvec = tvec
+                saved_bbox = bbox
+                saved_data = data
+    else:
+        # Use the saved rvec, tvec, bbox
+        draw_qr_pose_info(frame, saved_bbox, saved_data, saved_rvec, saved_tvec, camera_matrix, dist_coeffs)
+
+    mask = cv2.inRange(frame_hsv, lower_color, upper_color)
+    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
     if results.multi_hand_landmarks:
         for hand_landmarks in results.multi_hand_landmarks:
@@ -162,34 +223,71 @@ while cap.isOpened():
             cv2.circle(frame, (index_tip_x, index_tip_y), 10, (0, 255, 0), -1)
 
             # Track thumb movement to detect switch flip
-            if previous_thumb_y is not None:
-                movement = thumb_tip_y - previous_thumb_y
-                if abs(movement) > 20:  # Threshold for detecting significant movement
-                    if movement > 0:
-                        for box in led_boxes_local:
-                            if (box[0][1] < thumb_tip_y < box[3][1]): # and (box[0][0]< thumb_tip_x < box[1][0]):
-                                print("Switch flip down detected")
-                    else:
-                        for box in led_boxes_local:
-                            if (box[0][1] < thumb_tip_y < box[3][1]): # and (box[0][0]< thumb_tip_x < box[1][0]):
-                                print("Switch flip up detected")
+            if (projected_image_box) is not None:
+                for i, box in enumerate(projected_image_box):
+
+                    if (previous_thumb_y is not None) and (previous_thumb_x is not None):
+                        if (i <= 2):
+                            t_movement = thumb_tip_y - previous_thumb_y
+                            if abs(t_movement) > 10:  # Threshold for detecting significant movement
+                                if t_movement > 0:
+                                    if in_box(box, thumb_tip_x, thumb_tip_y) and in_box(box, index_tip_x, index_tip_y):
+                                        print("Switch", i+1, "down detected")
+                                else:
+                                    if in_box(box, thumb_tip_x, thumb_tip_y) and in_box(box, index_tip_x, index_tip_y):
+                                        print("Switch", i+1, "up detected")
+                        if (i > 2):
+                            t_movement = thumb_tip_x - previous_thumb_x
+                            if abs(t_movement) > 10:  # Threshold for detecting significant movement
+                                if t_movement > 0:
+                                    if in_box(box, thumb_tip_x, thumb_tip_y) and in_box(box, index_tip_x, index_tip_y):
+                                        print("Switch", i+1, "right detected")
+                                else:
+                                    if in_box(box, thumb_tip_x, thumb_tip_y) and in_box(box, index_tip_x, index_tip_y):
+                                        print("Switch", i+1, "left detected")
+                    
+                    for contour in contours:
+                        area = cv2.contourArea(contour)
+                        if 2000 > area > 500:  # Adjust area threshold to filter noise
+                            # Draw a rectangle around the detected
+                            x, y, w, h = cv2.boundingRect(contour)
+                            if (previous_y is not None) and (previous_x is not None):
+                                if (i <= 2):
+                                    movement = y - previous_y
+                                    if abs(movement) > 10:  # Threshold for detecting significant movement
+                                        if movement > 0:
+                                            if in_box(box, x, y) and in_box(box, x, y):
+                                                print("Switch", i+1, "down detected: color")
+                                        else:
+                                            if in_box(box, x, y) and in_box(box, x, y):
+                                                print("Switch", i+1, "up detected: color")
+                                if (i > 2):
+                                    movement = x - previous_x
+                                    if abs(movement) > 10:  # Threshold for detecting significant movement
+                                        if movement > 0:
+                                            if in_box(box, x, y) and in_box(box, x, y):
+                                                print("Switch", i+1, "right detected: color")
+                                        else:
+                                            if in_box(box, x, y) and in_box(box, x, y):
+                                                print("Switch", i+1, "left detected: color")
+
+                            if (previous_y is not None) and (previous_x is not None):
+                                movement = y - previous_y
+                                if (in_box(box, x, y)):
+                                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+            previous_x = x
+            previous_y = y
+
             previous_thumb_y = thumb_tip_y
-
-
-            
-
-    data, bbox = detect_single_qr_code(frame)
-    if bbox is not None and len(bbox) == 4:
-        success, rvec, tvec = cv2.solvePnP(
-            object_points, bbox, camera_matrix, dist_coeffs,
-            flags=cv2.SOLVEPNP_ITERATIVE
-        )
-        if success:
-            draw_qr_pose_info(frame, bbox, data, rvec, tvec, camera_matrix, dist_coeffs)
+            previous_thumb_x = thumb_tip_x
 
     cv2.imshow("QR Pose Estimation with LED Regions", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
         break
+    elif key == ord('r'):
+        qr_scanned = False
 
 cap.release()
 cv2.destroyAllWindows()
