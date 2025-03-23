@@ -1,9 +1,44 @@
 import cv2
+import mediapipe as mp
 import numpy as np
 from collections import deque
 
 QR_SIZE_CM = 3               # Size of QR code (cm)
 FOCAL_LENGTH = 1238.40
+
+# Initialize Mediapipe Hands
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7)
+previous_thumb_y = None
+
+colors = {
+    "green" : ([50, 0, 55], [86, 255, 255]),
+    "white" : ([0,0,240], [255, 15, 255])
+}
+
+# Switch Regions
+z_offset = 0.5  # Dynamic Z-distance in front of QR
+
+switch_centers = [
+        [1.0, 6.0, z_offset],
+        [3.3, 6.0, z_offset],
+        [6.3, 6.0, z_offset],
+        [1.8, 9.5, z_offset],
+        [6.0, 9.5, z_offset],
+    ]
+switch_size = (2.0, 2.0)  # Width and height
+
+led_boxes_local = []
+for cx, cy, cz in switch_centers:
+    w, h = switch_size
+    box = np.array([
+        [cx - w/2, cy - h/2, cz],
+        [cx + w/2, cy - h/2, cz],
+        [cx + w/2, cy + h/2, cz],
+        [cx - w/2, cy + h/2, cz]
+    ], dtype=np.float32)
+    led_boxes_local.append(box)
 
 N = 5
 depth_history = deque(maxlen=N)
@@ -75,29 +110,6 @@ def draw_qr_pose_info(frame, bbox, data, rvec, tvec, camera_matrix, dist_coeffs)
     cv2.putText(frame, f"Roll: {avg_roll:.2f}°", (center[0] + 10, center[1] + 40),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-    # Switch Regions
-    z_offset = 0.5  # Dynamic Z-distance in front of QR
-
-    switch_centers = [
-        [1.0, 6.0, z_offset],
-        [3.3, 6.0, z_offset],
-        [6.3, 6.0, z_offset],
-        [1.8, 9.5, z_offset],
-        [6.0, 9.5, z_offset],
-    ]
-    switch_size = (2.0, 2.0)  # Width and height
-
-    led_boxes_local = []
-    for cx, cy, cz in switch_centers:
-        w, h = switch_size
-        box = np.array([
-            [cx - w/2, cy - h/2, cz],
-            [cx + w/2, cy - h/2, cz],
-            [cx + w/2, cy + h/2, cz],
-            [cx - w/2, cy + h/2, cz]
-        ], dtype=np.float32)
-        led_boxes_local.append(box)
-
     # Draw each switch region
     for i, box in enumerate(led_boxes_local):
         image_box, _ = cv2.projectPoints(box, rvec, tvec, camera_matrix, dist_coeffs)
@@ -106,13 +118,14 @@ def draw_qr_pose_info(frame, bbox, data, rvec, tvec, camera_matrix, dist_coeffs)
         cv2.polylines(frame, [image_box], isClosed=True, color=(255, 255, 0), thickness=2)
         cx, cy = np.mean(image_box, axis=0).astype(int)
         cv2.putText(frame, f"LED {i+1}", (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
+    """
     print(f"QR Code: {data}")
     print(f"Position: x={tvec[0][0]:.2f} cm, y={tvec[1][0]:.2f} cm, z={avg_depth:.2f} cm")
     print(f"Orientation: Yaw={avg_yaw:.2f}°, Pitch={avg_pitch:.2f}°, Roll={avg_roll:.2f}°")
     for i, point in enumerate(bbox):
         print(f"Corner {i + 1}: (X: {point[0]:.1f}, Y: {point[1]:.1f})")
     print("-" * 40)
+    """
 
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
@@ -120,13 +133,50 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
 while cap.isOpened():
     ret, frame = cap.read()
-
     if not ret:
         break
+
+    # Flip frame horizontally for natural interaction
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
     camera_matrix = get_camera_matrix(frame.shape)
     dist_coeffs = np.zeros((4, 1)) 
 
+    results = hands.process(frame_rgb)
+
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+            # Get thumb and index finger tips for movement tracking
+            thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+            index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+
+            # Convert normalized landmarks to pixel coordinates
+            thumb_tip_x, thumb_tip_y = int(thumb_tip.x * frame.shape[1]), int(thumb_tip.y * frame.shape[0])
+            index_tip_x, index_tip_y = int(index_tip.x * frame.shape[1]), int(index_tip.y * frame.shape[0])
+
+            # Draw points on the frame
+            cv2.circle(frame, (thumb_tip_x, thumb_tip_y), 10, (255, 0, 0), -1)
+            cv2.circle(frame, (index_tip_x, index_tip_y), 10, (0, 255, 0), -1)
+
+            # Track thumb movement to detect switch flip
+            if previous_thumb_y is not None:
+                movement = thumb_tip_y - previous_thumb_y
+                if abs(movement) > 20:  # Threshold for detecting significant movement
+                    if movement > 0:
+                        for box in led_boxes_local:
+                            if (box[0][1] < thumb_tip_y < box[3][1]): # and (box[0][0]< thumb_tip_x < box[1][0]):
+                                print("Switch flip down detected")
+                    else:
+                        for box in led_boxes_local:
+                            if (box[0][1] < thumb_tip_y < box[3][1]): # and (box[0][0]< thumb_tip_x < box[1][0]):
+                                print("Switch flip up detected")
+            previous_thumb_y = thumb_tip_y
+
+
+            
 
     data, bbox = detect_single_qr_code(frame)
     if bbox is not None and len(bbox) == 4:
