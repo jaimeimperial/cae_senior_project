@@ -8,7 +8,7 @@ FOCAL_LENGTH = 1238.40
 
 colors = {
     'test_purple' :    [[110, 50, 130],    [130, 80, 190]],
-    'test_yellow' :    [[20, 110, 240],    [30, 150, 255]],
+    'test_yellow' :    [[200, 115, 180],    [235, 130, 205]],
     'black':    [[180, 255, 30],    [0, 0, 0]],
     'white':    [[180, 18, 255],    [0, 0, 231]],
     'red1':     [[180, 255, 255],   [159, 50, 70]],
@@ -25,6 +25,18 @@ colors = {
 color = "test_yellow"
 lower_color = np.array(colors[color][0])
 upper_color = np.array(colors[color][1])
+
+# Variables to hold points
+old_points = None
+old_gray = None
+roi_box = (600, 400, 100, 100)  # x, y, w, h of switch region
+
+# Parameters for Shi-Tomasi corner detection
+feature_params = dict(maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
+
+# Parameters for Lucas-Kanade optical flow
+lk_params = dict(winSize=(15, 15), maxLevel=2,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
 
 # Initialize Mediapipe Hands
 mp_hands = mp.solutions.hands
@@ -88,6 +100,7 @@ def in_box(box, x, y):
         return True
     else:
         return False
+
 
 def detect_single_qr_code(frame):
     qr_decoder = cv2.QRCodeDetector()
@@ -169,8 +182,8 @@ def draw_qr_pose_info(frame, bbox, data, rvec, tvec, camera_matrix, dist_coeffs)
     """
 
 cap = cv2.VideoCapture(0)
-#cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-#cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -180,6 +193,9 @@ while cap.isOpened():
     # Flip frame horizontally for natural interaction
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     frame_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    
+    mask = cv2.inRange(frame_hsv, lower_color, upper_color)
+    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
     camera_matrix = get_camera_matrix(frame.shape)
     dist_coeffs = np.zeros((4, 1)) 
@@ -203,9 +219,6 @@ while cap.isOpened():
         # Use the saved rvec, tvec, bbox
         draw_qr_pose_info(frame, saved_bbox, saved_data, saved_rvec, saved_tvec, camera_matrix, dist_coeffs)
 
-    mask = cv2.inRange(frame_hsv, lower_color, upper_color)
-    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
     if results.multi_hand_landmarks:
         for hand_landmarks in results.multi_hand_landmarks:
             mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
@@ -225,7 +238,6 @@ while cap.isOpened():
             # Track thumb movement to detect switch flip
             if (projected_image_box) is not None:
                 for i, box in enumerate(projected_image_box):
-
                     if (previous_thumb_y is not None) and (previous_thumb_x is not None):
                         if (i <= 2):
                             t_movement = thumb_tip_y - previous_thumb_y
@@ -245,42 +257,61 @@ while cap.isOpened():
                                 else:
                                     if in_box(box, thumb_tip_x, thumb_tip_y) and in_box(box, index_tip_x, index_tip_y):
                                         print("Switch", i+1, "left detected")
-                    
-                    for contour in contours:
-                        area = cv2.contourArea(contour)
-                        if 2000 > area > 500:  # Adjust area threshold to filter noise
-                            # Draw a rectangle around the detected
-                            x, y, w, h = cv2.boundingRect(contour)
-                            if (previous_y is not None) and (previous_x is not None):
-                                if (i <= 2):
-                                    movement = y - previous_y
-                                    if abs(movement) > 10:  # Threshold for detecting significant movement
-                                        if movement > 0:
-                                            if in_box(box, x, y) and in_box(box, x, y):
-                                                print("Switch", i+1, "down detected: color")
-                                        else:
-                                            if in_box(box, x, y) and in_box(box, x, y):
-                                                print("Switch", i+1, "up detected: color")
-                                if (i > 2):
-                                    movement = x - previous_x
-                                    if abs(movement) > 10:  # Threshold for detecting significant movement
-                                        if movement > 0:
-                                            if in_box(box, x, y) and in_box(box, x, y):
-                                                print("Switch", i+1, "right detected: color")
-                                        else:
-                                            if in_box(box, x, y) and in_box(box, x, y):
-                                                print("Switch", i+1, "left detected: color")
-
-                            if (previous_y is not None) and (previous_x is not None):
-                                movement = y - previous_y
-                                if (in_box(box, x, y)):
-                                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-            previous_x = x
-            previous_y = y
 
             previous_thumb_y = thumb_tip_y
             previous_thumb_x = thumb_tip_x
+            
+    frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Draw the ROI box
+    x, y, w, h = roi_box
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+    
+    if old_points is None or len(old_points) < 5:
+        roi = frame_gray[y:y + h, x:x + w]
+        old_points = cv2.goodFeaturesToTrack(roi, mask=None, **feature_params)
+        if old_points is not None:
+            # Offset keypoints to absolute frame coords
+            old_points += np.array([[x, y]], dtype=np.float32)
+        old_gray = frame_gray.copy()
+    else:
+        # Calculate Optical Flow
+        new_points, status, err = cv2.calcOpticalFlowPyrLK(old_gray, frame_gray, old_points, None, **lk_params)
+
+        if new_points is not None:
+            good_old = old_points[status == 1]
+            good_new = new_points[status == 1]
+
+            # Draw points and compute motion
+            motion_vectors = []
+            for i, (new, old) in enumerate(zip(good_new, good_old)):
+                a, b = new.ravel()
+                c, d = old.ravel()
+                motion_vectors.append((a - c, b - d))
+                cv2.circle(frame, (int(a), int(b)), 3, (0, 255, 0), -1)
+                cv2.line(frame, (int(a), int(b)), (int(c), int(d)), (0, 255, 255), 1)
+
+            # Average motion
+            if motion_vectors:
+                avg_dx = sum([dx for dx, dy in motion_vectors]) / len(motion_vectors)
+                avg_dy = sum([dy for dx, dy in motion_vectors]) / len(motion_vectors)
+
+                if abs(avg_dy) > abs(avg_dx):
+                    if avg_dy > 2:
+                        cv2.putText(frame, "Switch moved DOWN", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                        print("Switch Down")
+                    elif avg_dy < -2:
+                        cv2.putText(frame, "Switch moved UP", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                        print("Switch up")
+                else:
+                    if avg_dx > 2:
+                        cv2.putText(frame, "Switch moved RIGHT", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                    elif avg_dx < -2:
+                        cv2.putText(frame, "Switch moved LEFT", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
+
+            # Update for next frame
+            old_gray = frame_gray.copy()
+            old_points = good_new.reshape(-1, 1, 2)
 
     cv2.imshow("QR Pose Estimation with LED Regions", frame)
     key = cv2.waitKey(1) & 0xFF
