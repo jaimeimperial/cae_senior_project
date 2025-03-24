@@ -4,6 +4,13 @@ import numpy as np
 from scipy import stats
 from collections import deque
 import time
+import socket
+import json
+
+'''
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+serverAddressPort = ("127.0.0.1", 54789)
+'''
 
 QR_SIZE_CM = 3               # Size of QR code (cm)
 FOCAL_LENGTH = 1238.40
@@ -46,6 +53,7 @@ saved_tvec = None
 saved_bbox = None
 saved_data = None
 distance = False
+projected_switch_centers = None
 
 # Switch Regions
 z_offset = 0.5  # Dynamic Z-distance in front of QR
@@ -61,10 +69,11 @@ switch_size = (2.5, 3.0)  # Width and height
 
 last_flip_time = [0] * len(switch_centers)  # One timestamp per switch
 debounce_delay = 0.8  # seconds
-switch_states = ["OFF"] * len(switch_centers)        # Confirmed states
-predicted_states = ["OFF"] * len(switch_centers)     # Prediction from hand tracking
+switch_states = [0] * len(switch_centers)        # Confirmed states
+predicted_states = [0] * len(switch_centers)     # Prediction from hand tracking
 pending_flips = [False] * len(switch_centers)        # Waiting for confirmation
 
+qr_info = [0] * 15 
 
 led_boxes_local = []
 
@@ -81,20 +90,6 @@ for cx, cy, cz in switch_centers:
     box = box_local + np.array([cx, cy, cz], dtype=np.float32)
     led_boxes_local.append(box)
 
-""""
-w, h = switch_size
-half_w, half_h = w / 2, h / 2
-
-for cx, cy, cz in switch_centers:
-    box = np.array([
-        [cx - half_w, cy - half_h, cz],
-        [cx + half_w, cy - half_h, cz],
-        [cx + half_w, cy + half_h, cz],
-        [cx - half_w, cy + half_h, cz]
-    ], dtype=np.float32)
-    led_boxes_local.append(box)
-"""
-
 N = 5
 depth_history = deque(maxlen=N)
 yaw_history = deque(maxlen=N)
@@ -107,6 +102,14 @@ object_points = np.array([
     [QR_SIZE_CM, QR_SIZE_CM, 0],
     [0, QR_SIZE_CM, 0]
 ], dtype=np.float32)
+
+def send_unity(switch_states, qr_info):
+    payload = {
+        "sw states" : switch_states,
+        "qr_info" : qr_info,
+    }
+    message = json.dumps(payload).encode('utf-8')
+    sock.sendto(message, serverAddressPort)
 
 def in_box(box, x, y):
     right_edge = max(box[1][0], box[2][0])
@@ -188,6 +191,18 @@ def draw_qr_pose_info(frame, bbox, data, rvec, tvec, camera_matrix, dist_coeffs)
         cv2.polylines(frame, [image_box], isClosed=True, color=(255, 255, 0), thickness=2)
         cx, cy = np.mean(image_box, axis=0).astype(int)
         cv2.putText(frame, f"LED {i+1}", (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+    qr_info[0] = data
+    qr_info[1] = tvec[0][0]
+    qr_info[2] = tvec[1][0]
+    qr_info[3] = avg_depth
+    qr_info[4] = avg_yaw
+    qr_info[5] = avg_pitch
+    qr_info[6] = avg_roll
+    for j, pt in enumerate(bbox[:4]):  # Use first 4 corners of the QR
+        qr_info[7 + j*2] = pt[0]  # x
+        qr_info[7 + j*2 + 1] = pt[1]  # y
+
     """
     print(f"QR Code: {data}")
     print(f"Position: x={tvec[0][0]:.2f} cm, y={tvec[1][0]:.2f} cm, z={avg_depth:.2f} cm")
@@ -263,7 +278,7 @@ def hand_track_region(frame):
                                 t_movement = thumb_tip_y - previous_thumb_y
                                 if abs(t_movement) > 10:  # Threshold for detecting significant movement
                                     if in_box(box, thumb_tip_x, thumb_tip_y) and in_box(box, index_tip_x, index_tip_y):
-                                        predicted_state = "ON" if t_movement < 0 else "OFF"  # Flip logic
+                                        predicted_state = 1 if t_movement < 0 else 1  # Flip logic
                                         if predicted_states[i] != predicted_state:
                                             predicted_states[i] = predicted_state
                                             pending_flips[i] = True
@@ -273,7 +288,7 @@ def hand_track_region(frame):
                                 t_movement = thumb_tip_x - previous_thumb_x
                                 if abs(t_movement) > 10:  # Threshold for detecting significant movement
                                     if in_box(box, thumb_tip_x, thumb_tip_y) and in_box(box, index_tip_x, index_tip_y):
-                                        predicted_state = "ON" if t_movement < 0 else "OFF"  # Flip logic
+                                        predicted_state = 1 if t_movement < 0 else 1  # Flip logic
                                         if predicted_states[i] != predicted_state:
                                             predicted_states[i] = predicted_state
                                             pending_flips[i] = True
@@ -283,13 +298,14 @@ def hand_track_region(frame):
             previous_thumb_y = thumb_tip_y
             previous_thumb_x = thumb_tip_x
             
-            for landmark_pt in hand_pts:
-                for sw_pt in projected_switch_centers:
-                    dist = np.linalg.norm(landmark_pt - sw_pt)
-                    if dist < 100:  # Distance threshold in pixels
-                        cv2.putText(frame, "Hand near switch — skipping detection",
-                                    (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                        return False  # Skip color detection
+            if (projected_switch_centers is not None):
+                for landmark_pt in hand_pts:
+                    for sw_pt in projected_switch_centers:
+                        dist = np.linalg.norm(landmark_pt - sw_pt)
+                        if dist < 100:  # Distance threshold in pixels
+                            cv2.putText(frame, "Hand near switch — skipping detection",
+                                        (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                            return False  # Skip color detection
             
     return True
 
@@ -322,22 +338,24 @@ def color_detect_yellow(frame):
     if projected_image_box is not None:
         for i, box in enumerate(projected_image_box):
             # Convert to np.array for math
-            #print(box)
             box = np.array(box, dtype=np.int32)
             
             # Bounding rectangle
             roi_top_left = np.min(box, axis=0)
             roi_bottom_right = np.max(box, axis=0)
 
-            # Crop ROI
-            roi = frame[roi_top_left[1]:roi_bottom_right[1], roi_top_left[0]:roi_bottom_right[0]]
-            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            yellow_mask = cv2.inRange(hsv, lower_color, upper_color)
-            
-            # Apply global hand mask (remove hand regions)
-            hand_mask_roi = hand_mask[roi_top_left[1]:roi_bottom_right[1], roi_top_left[0]:roi_bottom_right[0]]
-            yellow_mask = cv2.bitwise_and(yellow_mask, cv2.bitwise_not(hand_mask_roi))
+            height, width = frame.shape[:2]
+            x1 = np.clip(roi_top_left[0], 0, width - 1)
+            y1 = np.clip(roi_top_left[1], 0, height - 1)
+            x2 = np.clip(roi_bottom_right[0], 0, width - 1)
+            y2 = np.clip(roi_bottom_right[1], 0, height - 1)
 
+            if y2 > y1 and x2 > x1:
+                roi = frame[y1:y2, x1:x2]
+                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                yellow_mask = cv2.inRange(hsv, lower_color, upper_color)
+            else:
+                print("Invalid ROI dimensions, skipping.")
 
             # Offset box coordinates into ROI-local space
             offset_box = box - roi_top_left
@@ -377,7 +395,7 @@ def color_detect_yellow(frame):
             count_b = cv2.countNonZero(cv2.bitwise_and(yellow_mask, yellow_mask, mask=mask_b))
 
             # Determine state
-            state = "ON" if count_a > count_b else "OFF"
+            state = 1 if count_a > count_b else 0
             
             # Confirm flip if one is pending
             if pending_flips[i]:
@@ -406,9 +424,8 @@ def color_detect_yellow(frame):
                         (label_pos[0], label_pos[1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
-                        (0, 255, 0) if state == "ON" else (0, 0, 255),
+                        (0, 255, 0) if state == 1 else (0, 0, 255),
                         2)
-
 
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
@@ -438,11 +455,12 @@ while cap.isOpened():
             cv2.circle(frame, (x, y), 6, (0, 255, 255), -1)
             cv2.putText(frame, f"SW{i+1}", (x + 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-    
     track_color = hand_track_region(frame)
     
     if track_color:
         color_detect_yellow(frame)
+
+    #send_unity(switch_states, qr_info)
 
     cv2.imshow("QR Pose Estimation with LED Regions", frame)
     key = cv2.waitKey(1) & 0xFF
