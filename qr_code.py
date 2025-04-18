@@ -59,6 +59,10 @@ switch_centers = [
     ]
 switch_size = (2.5, 3.0)  # Width and height
 
+button_centers = [
+    
+]
+
 last_flip_time = [0] * len(switch_centers)  # One timestamp per switch
 debounce_delay = 0.8  # seconds
 switch_states = ["OFF"] * len(switch_centers)        # Confirmed states
@@ -80,20 +84,6 @@ box_local = np.array([
 for cx, cy, cz in switch_centers:
     box = box_local + np.array([cx, cy, cz], dtype=np.float32)
     led_boxes_local.append(box)
-
-""""
-w, h = switch_size
-half_w, half_h = w / 2, h / 2
-
-for cx, cy, cz in switch_centers:
-    box = np.array([
-        [cx - half_w, cy - half_h, cz],
-        [cx + half_w, cy - half_h, cz],
-        [cx + half_w, cy + half_h, cz],
-        [cx - half_w, cy + half_h, cz]
-    ], dtype=np.float32)
-    led_boxes_local.append(box)
-"""
 
 N = 5
 depth_history = deque(maxlen=N)
