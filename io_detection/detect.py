@@ -1,16 +1,10 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-from scipy import stats
-from collections import deque
-import time
 import qr
 from zones import QR_ZONE_DEFINITIONS
 from constants import COLORS
 from constants import ENCODING
-
-projected_switch_centers = []
-projected_button_centers = []
 
 # Define color range for light detection (e.g., red light)
 sw_color = "switch_yellow"
@@ -21,9 +15,17 @@ btn_color = "led_green"
 btn_lower_color = np.array(COLORS[btn_color][0])
 btn_upper_color = np.array(COLORS[btn_color][1])
 
-knob_red = "knob_red"
+knob_red = "knob_red_low"
 knob_red_l = np.array(COLORS[knob_red][0])
 knob_red_u = np.array(COLORS[knob_red][1])
+
+knob_red_2 = "knob_red_high"
+knob_red_l2 = np.array(COLORS[knob_red_2][0])
+knob_red_u2 = np.array(COLORS[knob_red_2][1])
+
+knob_green = "knob_green"
+knob_green_l = np.array(COLORS[knob_green][0])
+knob_green_u = np.array(COLORS[knob_green][1])
 
 knob_blue = "knob_blue"
 knob_blue_l = np.array(COLORS[knob_blue][0])
@@ -36,23 +38,6 @@ knob_magenta_u = np.array(COLORS[knob_magenta][1])
 knob_yellow = "knob_yellow"
 knob_yellow_l = np.array(COLORS[knob_yellow][0])
 knob_yellow_u = np.array(COLORS[knob_yellow][1])
-
-hand_mask = np.zeros((1080, 1920), dtype=np.uint8)  # Update if frame size changes
-
-zone_def = QR_ZONE_DEFINITIONS.get("1")
-switch_centers = zone_def["centers"]
-
-previous_thumb_y = None
-previous_thumb_x = None
-previous_y = None
-previous_x = None
-
-
-last_flip_time = [0] * len(switch_centers)  # One timestamp per switch
-debounce_delay = 0.8  # seconds
-switch_states = ["OFF"] * len(switch_centers)        # Confirmed states
-predicted_states = ["OFF"] * len(switch_centers)     # Prediction from hand tracking
-pending_flips = [False] * len(switch_centers)        # Waiting for confirmation
 
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
@@ -69,10 +54,7 @@ def in_box(box, x, y):
         return False
 
 def hand_track_region(frame):
-    global previous_thumb_x, previous_thumb_y, distance
-    
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
     results = hands.process(frame_rgb)
     
     blocked = []
@@ -108,18 +90,21 @@ def hand_track_region(frame):
                 x = int(lm.x * frame.shape[1])
                 y = int(lm.y * frame.shape[0])
                 hand_pts.append(np.array([x, y]))
+                
+            hand_pts_np = np.array(hand_pts)  # shape: (N, 2)
+            for module_data in qr.qr_cache.values():
+                centers = np.array(module_data['centers'])  # shape: (M, 2)
 
-            for landmark_pt in hand_pts:
-                for sw_pt, bu_pt in zip(projected_switch_centers, projected_button_centers):
-                    sw_dist = np.linalg.norm(landmark_pt - sw_pt)
-                    bu_dist = np.linalg.norm(landmark_pt - bu_pt)
-                    if (sw_dist < 100):  # Distance threshold in pixels
-                        blocked.append("Switch")
-                    if (bu_dist < 100):  # Distance threshold in pixels
-                        blocked.append("Button")
-                    
+                # Compute pairwise distances between all hand points and all projected centers
+                dists = np.linalg.norm(hand_pts_np[:, np.newaxis, :] - centers[np.newaxis, :, :], axis=2)
+                min_dists = np.min(dists, axis=1)
+
+                if np.any(min_dists < 150):  # threshold
+                    blocked.append(module_data['zone_def']['type'])
+
             if blocked != []:
                 cv2.putText(frame, "Occlusion Detected", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
     return blocked
 
 def detect_switch(frame):
@@ -141,7 +126,16 @@ def detect_switch(frame):
             roi_bottom_right = np.max(box, axis=0)
             
             # Crop ROI
-            roi = frame[roi_top_left[1]:roi_bottom_right[1], roi_top_left[0]:roi_bottom_right[0]]
+            h, w = frame.shape[:2]
+            x1 = max(0, roi_top_left[0])
+            y1 = max(0, roi_top_left[1])
+            x2 = min(w, roi_bottom_right[0])
+            y2 = min(h, roi_bottom_right[1])
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            roi = frame[y1:y2, x1:x2]
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             yellow_mask = cv2.inRange(hsv, sw_lower_color, sw_upper_color)
             
@@ -178,6 +172,11 @@ def detect_switch(frame):
             # Determine state
             state = "ON" if count_a > count_b else "OFF"
             
+            if state == "ON":
+                qr.qr_cache[key]['state'][i] = 1
+            else:
+                qr.qr_cache[key]['state'][i] = 0
+            
             # Draw switch box
             cv2.polylines(frame, [box], isClosed=True, color=(255, 0, 0), thickness=2)
             # Draw divider line
@@ -208,7 +207,16 @@ def detect_button(frame):
             roi_bottom_right = np.max(box, axis=0)
             
             # Make a mask over the ROI
-            roi = frame[roi_top_left[1]:roi_bottom_right[1], roi_top_left[0]:roi_bottom_right[0]]
+            h, w = frame.shape[:2]
+            x1 = max(0, roi_top_left[0])
+            y1 = max(0, roi_top_left[1])
+            x2 = min(w, roi_bottom_right[0])
+            y2 = min(h, roi_bottom_right[1])
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            roi = frame[y1:y2, x1:x2]
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
             # Create green mask
@@ -216,11 +224,12 @@ def detect_button(frame):
             
             # Count # of green pixels
             nonzero = cv2.countNonZero(mask)
-            print(i, nonzero)
             
             label_pos = tuple(box[0])
+            
             # Threshold to determine "LED is on"
-            if nonzero > 1000:
+            if nonzero > 500:
+                qr.qr_cache[key]['state'][i] = 1
                 cv2.putText(frame, f"BTN {i+1}: ON",
                         (label_pos[0], label_pos[1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX,
@@ -228,6 +237,7 @@ def detect_button(frame):
                         (0, 255, 0),
                         2)
             else:
+                qr.qr_cache[key]['state'][i] = 0
                 cv2.putText(frame, f"BTN {i+1}: OFF",
                         (label_pos[0], label_pos[1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX,
@@ -237,9 +247,8 @@ def detect_button(frame):
 
             # Draw rectangle and status on original frame
             cv2.polylines(frame, [box], isClosed=True, color=(255, 0, 0), thickness=2)
-            
-            
-            
+
+
 def detect_knob(frame):
     for key in list(qr.qr_cache.keys()):
         # Check if the current QR code is a button
@@ -249,11 +258,7 @@ def detect_knob(frame):
         
         boxes = qr.qr_cache[key].get('boxes')
         
-        knobs = {
-            1 : [],
-            2 : []
-        }
-        
+        temp_states = [0] * len(boxes)
         for i, box in enumerate(boxes):
             box = np.array(box, dtype=np.int32)
             
@@ -262,15 +267,28 @@ def detect_knob(frame):
             roi_bottom_right = np.max(box, axis=0)
             
             # Make a mask over the ROI
-            roi = frame[roi_top_left[1]:roi_bottom_right[1], roi_top_left[0]:roi_bottom_right[0]]
+            h, w = frame.shape[:2]
+            x1 = max(0, roi_top_left[0])
+            y1 = max(0, roi_top_left[1])
+            x2 = min(w, roi_bottom_right[0])
+            y2 = min(h, roi_bottom_right[1])
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            roi = frame[y1:y2, x1:x2]
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
             # Create red mask and count # of red pixels
             red_mask = cv2.inRange(hsv, knob_red_l, knob_red_u)
             red_count = cv2.countNonZero(red_mask)
             
+            # Create red mask and count # of red pixels
+            red_mask2 = cv2.inRange(hsv, knob_red_l2, knob_red_u2)
+            red_count += cv2.countNonZero(red_mask2)
+            
             # Create green mask and count # of green pixels 
-            green_mask = cv2.inRange(hsv, btn_lower_color, btn_upper_color)
+            green_mask = cv2.inRange(hsv, knob_green_l, knob_green_u)
             green_count = cv2.countNonZero(green_mask)
 
             # Create blue mask and count # of blue pixels 
@@ -285,46 +303,75 @@ def detect_knob(frame):
             yellow_mask = cv2.inRange(hsv, knob_yellow_l, knob_yellow_u)
             yellow_count = cv2.countNonZero(yellow_mask)
             
-            OFF_THRESHOLD = 300
+            OFF_THRESHOLD = 100
             
             counts = [OFF_THRESHOLD, red_count, green_count, blue_count, magenta_count, yellow_count]
             
             dominant_color = OFF_THRESHOLD
             dominant_color_idx = 0
-            for i in range(len(counts)):
-                if counts[i] > dominant_color:
-                    dominant_color = counts[i]
-                    dominant_color_idx = i
+            for j in range(len(counts)):
+                if counts[j] > dominant_color:
+                    dominant_color = counts[j]
+                    dominant_color_idx = j
 
             state = dominant_color_idx
-            # Get the led box state and update the appropriate slot in knobs dict
-            knob_num = i // 2 + 1
-            slot = i % 2
-            knobs[knob_num][slot] = state
+            
+            temp_states[i] = state
             
             if state == 0:
-                color = (211, 211, 211)
+                col = (211, 211, 211)
             elif state == 1:
-                color = (255, 255, 255)
+                col = (0, 0, 255)
             elif state == 2:
-                color = (0, 255, 0)
+                col = (0, 255, 0)
             elif state == 3:
-                color = (0, 0, 255)
+                col = (255, 255, 0)
             elif state == 4:
-                color = (255, 0, 255)
+                col = (255, 0, 255)
             else:
-                color = (255, 255, 0)
+                col = (5, 226, 252)
 
             # Draw rectangle and status on original frame
             cv2.polylines(frame, [box], isClosed=True, color=(255, 0, 0), thickness=2)
-            label_pos = tuple(box[0])
             
-            cv2.putText(frame, f"KNOB {i+1}: {state}",
+            text = f"KNOB {i+1}: {state}"
+            
+            label_pos = tuple(box[0])
+            position = (label_pos[0], label_pos[1] - 10)
+            
+            cv2.putText(frame, text,
+            (position[0] + 1, position[1] + 1),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA)
+            
+            cv2.putText(frame, text,
                         (label_pos[0], label_pos[1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.4,
-                        color,
+                        0.6,
+                        col,
                         2)
         
-        knob1 = ENCODING[tuple(knobs[1])]
-        knob2 = ENCODING[tuple(knobs[2])]
+        encoded = base6_to_decimal(temp_states)
+
+        qr.qr_cache[key]['state'] = encoded
+
+def base6_to_decimal(list):
+    if ((len(list) % 2) != 0) or (len(list) < 2):
+        print("Incorrect list size")
+        return -1
+    
+    decimal_list = []
+
+    for i in range(1, len(list), 2):
+        MSD = list[i]
+        LSD = list[i - 1]
+        decimal_list.append(ENCODING.get((MSD, LSD)))
+    
+    if -1 in decimal_list:
+        print("State error")
+        return -1
+    
+    return decimal_list

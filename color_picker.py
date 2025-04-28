@@ -4,6 +4,11 @@ import numpy as np
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+cap.set(cv2.CAP_PROP_EXPOSURE, 5)
+cap.set(cv2.CAP_PROP_GAIN, 0)
+cap.set(cv2.CAP_PROP_BRIGHTNESS, 5)
+cap.set(cv2.CAP_PROP_FPS, 144)
 
 while True:
     ret, frame = cap.read()
@@ -12,6 +17,11 @@ while True:
 
     # Convert to HSV
     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    
+    '''
+    h, s, v = cv2.split(hsv)
+    v = np.clip(v, 0, 255)  # reduce max brightness
+    hsv_frame = cv2.merge((h, s, v))'''
 
     # Show the HSV values when clicking on a pixel
     def pick_color(event, x, y, flags, param):

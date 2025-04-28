@@ -1,9 +1,5 @@
 import cv2
-import mediapipe as mp
 import numpy as np
-from scipy import stats
-from collections import deque
-import time
 import detect
 from constants import FOCAL_LENGTH, OBJECT_POINTS
 from zones import QR_ZONE_DEFINITIONS
@@ -101,17 +97,23 @@ def draw_projected_zones(frame):
         # Project transformed 3D points to 2D
         image_points, _ = cv2.projectPoints(transformed_switches.reshape(-1, 1, 3), np.zeros((3, 1)), np.zeros((3, 1)), camera_matrix, np.zeros((4, 1)))
         
+        projected_centers = [pt.ravel().astype(int) for pt in image_points]
+        
         if code == "1":
-            detect.projected_switch_centers = [pt.ravel().astype(int) for pt in image_points]
             for i, point in enumerate(image_points):
                 x, y = point.ravel().astype(int)
                 cv2.circle(frame, (x, y), 6, (0, 255, 255), -1)
         elif code == "2":
-            detect.projected_button_centers = [pt.ravel().astype(int) for pt in image_points]
             for i, point in enumerate(image_points):
                 x, y = point.ravel().astype(int)
                 cv2.circle(frame, (x, y), 6, (0, 255, 255), -1)
-                cv2.putText(frame, f"BTN{i+1}", (x + 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2) 
+                cv2.putText(frame, f"BTN{i+1}", (x + 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        elif code == "3":
+            for i, point in enumerate(image_points):
+                x, y = point.ravel().astype(int)
+                cv2.circle(frame, (x, y), 6, (0, 255, 255), -1)
+        
+        qr_cache[code]['centers'] = projected_centers
 
 def init_qr(frame):
     global qr_cache
@@ -142,7 +144,9 @@ def init_qr(frame):
                     'rvec': rvec,
                     'tvec': tvec,
                     'boxes': boxes, # Projected boxes
-                    'zone_def': zone_def
+                    'zone_def': zone_def,
+                    'state' : [0] * len(zone_def.get("centers")),
+                    'centers' : [0] * len(zone_def.get("centers"))
                     }
     else:
         # Use the saved rvec, tvec, bbox

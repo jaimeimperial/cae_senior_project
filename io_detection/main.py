@@ -1,17 +1,17 @@
 import cv2
-import mediapipe as mp
-import numpy as np
-from scipy import stats
-from collections import deque
-import time
 import qr
-import zones
 import detect
+import udp
 
 # Main video loop
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+cap.set(cv2.CAP_PROP_EXPOSURE, 5)
+cap.set(cv2.CAP_PROP_GAIN, 0)
+cap.set(cv2.CAP_PROP_BRIGHTNESS, 5)
+cap.set(cv2.CAP_PROP_FPS, 144)
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -24,15 +24,16 @@ while cap.isOpened():
     # Detect I/O states if not occluded
     blocked = detect.hand_track_region(frame)
     detection_map = {
-        "Switch": detect.detect_switch,
-        "Button": detect.detect_button,
-        #"Knob": detect.detect_knob
+        "switch": detect.detect_switch,
+        "button": detect.detect_button,
+        "knob"  : detect.detect_knob
     }
     for name, func in detection_map.items():
         if name not in blocked:
             func(frame)
 
-    
+    udp.send_info(qr.qr_cache)
+
     cv2.imshow("Multi-QR Zone Detection", frame)
     
     key = cv2.waitKey(1) & 0xFF
